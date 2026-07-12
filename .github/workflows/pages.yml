@@ -28,6 +28,7 @@ jobs:
         run: |
           mkdir -p _site
           cp "src/PDF Annotate.html" _site/index.html
+          cp src/ogp.png _site/ogp.png
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
