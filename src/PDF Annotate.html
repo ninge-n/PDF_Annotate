@@ -147,6 +147,7 @@ const RENDER_SCALE = 1.6;
 
 let pdfDoc = null;          // pdf.js document
 let originalBytes = null;   // 元のPDFバイナリ (ArrayBuffer)
+let pdfPassword = '';       // 閲覧パスワード付きPDF用（開くときに入力されたものを保存時にも使う）
 let currentPage = 1;
 let numPages = 0;
 let pageBoxes = {};         // { pageNumber: [ {id,x,y,text,fontSize,color} ] }
@@ -183,8 +184,28 @@ fileInput.addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;
   originalBytes = await file.arrayBuffer();
-  const loadingTask = pdfjsLib.getDocument({ data: originalBytes.slice(0) });
-  pdfDoc = await loadingTask.promise;
+  pdfPassword = '';
+  // 閲覧パスワード付きPDFは入力を促し、正しいパスワードが入るまで再試行
+  while (true) {
+    try {
+      const loadingTask = pdfjsLib.getDocument({ data: originalBytes.slice(0), password: pdfPassword });
+      pdfDoc = await loadingTask.promise;
+      break;
+    } catch (err) {
+      if (err && err.name === 'PasswordException') {
+        const input = prompt(
+          err.code === pdfjsLib.PasswordResponses.INCORRECT_PASSWORD
+            ? 'パスワードが違います。もう一度入力してください:'
+            : 'このPDFはパスワードで保護されています。パスワードを入力してください:'
+        );
+        if (input === null) return; // キャンセル
+        pdfPassword = input;
+      } else {
+        alert('PDFを開けませんでした: ' + (err && err.message ? err.message : err));
+        return;
+      }
+    }
+  }
   numPages = pdfDoc.numPages;
   currentPage = 1;
   pageBoxes = {};
@@ -320,8 +341,27 @@ saveBtn.addEventListener('click', async () => {
   saveBtn.textContent = '保存中...';
   try {
     const { PDFDocument, rgb } = PDFLib;
-    // 役所の様式PDFに多い「編集のみ制限」の暗号化は空パスワードで復号できる
-    const pdfLibDoc = await PDFDocument.load(originalBytes.slice(0), { password: '' });
+    // 役所の様式PDFに多い「編集のみ制限」の暗号化は空パスワードで復号できる。
+    // 閲覧パスワード付きPDFは開くときに入力されたパスワードを使い、それでも失敗したら再入力を促す
+    let pdfLibDoc;
+    while (true) {
+      try {
+        pdfLibDoc = await PDFDocument.load(originalBytes.slice(0), { password: pdfPassword });
+        break;
+      } catch (err) {
+        if (err && (err.message === 'NEEDS PASSWORD' || err.message === 'Password incorrect')) {
+          const input = prompt(
+            err.message === 'Password incorrect'
+              ? 'パスワードが違います。もう一度入力してください:'
+              : 'このPDFはパスワードで保護されています。パスワードを入力してください:'
+          );
+          if (input === null) return; // キャンセル（finallyでボタンは元に戻る）
+          pdfPassword = input;
+        } else {
+          throw err;
+        }
+      }
+    }
     pdfLibDoc.registerFontkit(fontkit);
 
     const jpFontBytes = await getJpFontBytes();
