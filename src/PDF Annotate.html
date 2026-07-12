@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>PDF テキスト追記ツール</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@cantoo/pdf-lib@2.7.1/dist/pdf-lib.min.js"></script>
+<script src="https://unpkg.com/@pdf-lib/fontkit@1.1.1/dist/fontkit.umd.min.js"></script>
+<style>
+  :root{
+    --bg:#1b1d22;
+    --panel:#24262d;
+    --line:#3a3d46;
+    --text:#e7e8ec;
+    --muted:#9a9dab;
+    --accent:#5b8dee;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    font-family:"Segoe UI","Hiragino Sans","Yu Gothic",sans-serif;
+    background:var(--bg);
+    color:var(--text);
+    height:100vh;
+    display:flex;
+    flex-direction:column;
+  }
+  #toolbar{
+    display:flex;
+    align-items:center;
+    gap:12px;
+    padding:10px 16px;
+    background:var(--panel);
+    border-bottom:1px solid var(--line);
+    flex-wrap:wrap;
+  }
+  #toolbar button, #toolbar label.file-btn{
+    background:#2f323c;
+    color:var(--text);
+    border:1px solid var(--line);
+    border-radius:6px;
+    padding:6px 12px;
+    cursor:pointer;
+    font-size:13px;
+  }
+  #toolbar button:hover, #toolbar label.file-btn:hover{ background:#383b46; }
+  #toolbar button:disabled{ opacity:0.4; cursor:default; }
+  #toolbar input[type=file]{ display:none; }
+  #toolbar input[type=number]{
+    width:56px;
+    background:#2f323c;
+    color:var(--text);
+    border:1px solid var(--line);
+    border-radius:6px;
+    padding:5px;
+  }
+  #toolbar input[type=color]{
+    width:34px;height:30px;border:1px solid var(--line);border-radius:6px;background:none;padding:0;cursor:pointer;
+  }
+  #save-btn{ background:var(--accent); border-color:var(--accent); margin-left:auto; }
+  #page-info{ color:var(--muted); font-size:13px; min-width:80px; text-align:center;}
+  #hint{ width:100%; font-size:12px; color:var(--muted); margin-top:2px; }
+  #main{
+    flex:1;
+    overflow:auto;
+    display:flex;
+    justify-content:center;
+    padding:24px;
+  }
+  #stage{
+    position:relative;
+    box-shadow:0 4px 24px rgba(0,0,0,0.5);
+    background:#fff;
+    line-height:0;
+  }
+  #pdf-canvas{ display:block; }
+  #overlay{
+    position:absolute;
+    top:0;left:0;
+    width:100%;height:100%;
+  }
+  .textbox{
+    position:absolute;
+    min-width:20px;
+    min-height:1em;
+    padding:2px 4px;
+    border:1px dashed rgba(91,141,238,0.7);
+    background:rgba(91,141,238,0.06);
+    outline:none;
+    white-space:pre;
+    cursor:move;
+    color:#111;
+  }
+  .textbox:focus{
+    border:1px solid var(--accent);
+    background:rgba(91,141,238,0.12);
+    cursor:text;
+  }
+  .textbox .del{
+    position:absolute;
+    top:-10px;right:-10px;
+    width:18px;height:18px;
+    border-radius:50%;
+    background:#d9534f;
+    color:#fff;
+    font-size:12px;
+    line-height:18px;
+    text-align:center;
+    cursor:pointer;
+    display:none;
+  }
+  .textbox:hover .del{ display:block; }
+  #empty-state{
+    color:var(--muted);
+    margin:auto;
+    text-align:center;
+    font-size:14px;
+  }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <label class="file-btn">PDFを開く<input type="file" id="file-input" accept="application/pdf"></label>
+  <button id="prev-btn" disabled>◀ 前へ</button>
+  <span id="page-info">-</span>
+  <button id="next-btn" disabled>次へ ▶</button>
+  <button id="add-text-btn" disabled>＋ テキスト追加</button>
+  <label style="font-size:13px;color:var(--muted);">サイズ<input type="number" id="font-size" value="16" min="6" max="96"></label>
+  <input type="color" id="font-color" value="#000000" title="文字色">
+  <button id="save-btn" disabled>PDFを保存</button>
+  <div id="hint">キャンバス上をクリックするとその位置にテキストボックスが追加されます。ドラッグで移動、右上の×で削除できます。保存時に日本語フォント（M PLUS 1p, 約1.7MB）を読み込むため、初回保存時のみ数秒かかります。</div>
+</div>
+
+<div id="main">
+  <div id="empty-state">左上の「PDFを開く」からファイルを選択してください</div>
+  <div id="stage" style="display:none;">
+    <canvas id="pdf-canvas"></canvas>
+    <div id="overlay"></div>
+  </div>
+</div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+const RENDER_SCALE = 1.6;
+
+let pdfDoc = null;          // pdf.js document
+let originalBytes = null;   // 元のPDFバイナリ (ArrayBuffer)
+let currentPage = 1;
+let numPages = 0;
+let pageBoxes = {};         // { pageNumber: [ {id,x,y,text,fontSize,color} ] }
+let boxIdCounter = 0;
+
+const fileInput = document.getElementById('file-input');
+const prevBtn = document.getElementById('prev-btn');
+const nextBtn = document.getElementById('next-btn');
+const addTextBtn = document.getElementById('add-text-btn');
+const saveBtn = document.getElementById('save-btn');
+const pageInfo = document.getElementById('page-info');
+const canvas = document.getElementById('pdf-canvas');
+const ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+const stage = document.getElementById('stage');
+const emptyState = document.getElementById('empty-state');
+const fontSizeInput = document.getElementById('font-size');
+const fontColorInput = document.getElementById('font-color');
+
+let addMode = false;
+
+const JP_FONT_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/mplus1p/MPLUS1p-Regular.ttf";
+let jpFontBytesCache = null;
+
+async function getJpFontBytes() {
+  if (jpFontBytesCache) return jpFontBytesCache;
+  const res = await fetch(JP_FONT_URL);
+  if (!res.ok) throw new Error("日本語フォントの取得に失敗しました");
+  jpFontBytesCache = await res.arrayBuffer();
+  return jpFontBytesCache;
+}
+
+fileInput.addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  originalBytes = await file.arrayBuffer();
+  const loadingTask = pdfjsLib.getDocument({ data: originalBytes.slice(0) });
+  pdfDoc = await loadingTask.promise;
+  numPages = pdfDoc.numPages;
+  currentPage = 1;
+  pageBoxes = {};
+  boxIdCounter = 0;
+  stage.style.display = 'block';
+  emptyState.style.display = 'none';
+  prevBtn.disabled = false;
+  nextBtn.disabled = false;
+  addTextBtn.disabled = false;
+  saveBtn.disabled = false;
+  await renderPage(currentPage);
+});
+
+async function renderPage(num) {
+  const page = await pdfDoc.getPage(num);
+  const viewport = page.getViewport({ scale: RENDER_SCALE });
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  overlay.style.width = viewport.width + 'px';
+  overlay.style.height = viewport.height + 'px';
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  pageInfo.textContent = `${num} / ${numPages}`;
+  rebuildOverlay();
+}
+
+function rebuildOverlay() {
+  overlay.innerHTML = '';
+  const boxes = pageBoxes[currentPage] || [];
+  boxes.forEach(box => overlay.appendChild(createBoxElement(box)));
+}
+
+function createBoxElement(box) {
+  const el = document.createElement('div');
+  el.className = 'textbox';
+  el.contentEditable = 'true';
+  el.style.left = box.x + 'px';
+  el.style.top = box.y + 'px';
+  el.style.fontSize = box.fontSize + 'px';
+  el.style.color = box.color;
+  el.textContent = box.text;
+  el.dataset.id = box.id;
+
+  const del = document.createElement('span');
+  del.className = 'del';
+  del.textContent = '×';
+
+  // 削除ボタン(del)も子要素なので、el.textContent をそのまま使うと「×」が混入する
+  el.addEventListener('input', () => {
+    box.text = Array.from(el.childNodes)
+      .filter(n => n !== del)
+      .map(n => n.textContent)
+      .join('');
+  });
+  del.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const arr = pageBoxes[currentPage];
+    pageBoxes[currentPage] = arr.filter(b => b.id !== box.id);
+    el.remove();
+  });
+  el.appendChild(del);
+
+  // ドラッグ移動
+  let dragging = false, startX, startY, origX, origY;
+  el.addEventListener('mousedown', (e) => {
+    if (document.activeElement === el && e.target === el) return; // 文字選択優先
+    if (e.target === del) return;
+    dragging = true;
+    startX = e.clientX; startY = e.clientY;
+    origX = box.x; origY = box.y;
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    box.x = origX + (e.clientX - startX);
+    box.y = origY + (e.clientY - startY);
+    el.style.left = box.x + 'px';
+    el.style.top = box.y + 'px';
+  });
+  document.addEventListener('mouseup', () => { dragging = false; });
+
+  return el;
+}
+
+addTextBtn.addEventListener('click', () => {
+  addMode = !addMode;
+  addTextBtn.style.background = addMode ? 'var(--accent)' : '';
+  canvas.style.cursor = addMode ? 'crosshair' : 'default';
+});
+
+overlay.addEventListener('click', (e) => {
+  if (!addMode || e.target !== overlay) return;
+  const rect = overlay.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+  const box = {
+    id: ++boxIdCounter,
+    x, y,
+    text: '',
+    fontSize: parseInt(fontSizeInput.value, 10) || 16,
+    color: fontColorInput.value
+  };
+  if (!pageBoxes[currentPage]) pageBoxes[currentPage] = [];
+  pageBoxes[currentPage].push(box);
+  const el = createBoxElement(box);
+  overlay.appendChild(el);
+  el.focus();
+  addMode = false;
+  addTextBtn.style.background = '';
+  canvas.style.cursor = 'default';
+});
+
+prevBtn.addEventListener('click', async () => {
+  if (currentPage <= 1) return;
+  currentPage--;
+  await renderPage(currentPage);
+});
+nextBtn.addEventListener('click', async () => {
+  if (currentPage >= numPages) return;
+  currentPage++;
+  await renderPage(currentPage);
+});
+
+function hexToRgb01(hex) {
+  const v = hex.replace('#', '');
+  const r = parseInt(v.substring(0, 2), 16) / 255;
+  const g = parseInt(v.substring(2, 4), 16) / 255;
+  const b = parseInt(v.substring(4, 6), 16) / 255;
+  return { r, g, b };
+}
+
+saveBtn.addEventListener('click', async () => {
+  saveBtn.disabled = true;
+  saveBtn.textContent = '保存中...';
+  try {
+    const { PDFDocument, rgb } = PDFLib;
+    // 役所の様式PDFに多い「編集のみ制限」の暗号化は空パスワードで復号できる
+    const pdfLibDoc = await PDFDocument.load(originalBytes.slice(0), { password: '' });
+    pdfLibDoc.registerFontkit(fontkit);
+
+    const jpFontBytes = await getJpFontBytes();
+    // subset: true は @pdf-lib/fontkit のバグで日本語グリフが欠けるため使用不可
+    const jpFont = await pdfLibDoc.embedFont(jpFontBytes, { subset: false });
+    const pages = pdfLibDoc.getPages();
+
+    for (const [pageNumStr, boxes] of Object.entries(pageBoxes)) {
+      const pageNum = parseInt(pageNumStr, 10);
+      const page = pages[pageNum - 1];
+      const { height } = page.getSize();
+
+      for (const box of boxes) {
+        if (!box.text) continue;
+        const pdfX = box.x / RENDER_SCALE;
+        const pdfY = height - (box.y / RENDER_SCALE) - box.fontSize / RENDER_SCALE;
+        const { r, g, b } = hexToRgb01(box.color);
+        page.drawText(box.text, {
+          x: pdfX,
+          y: pdfY,
+          size: box.fontSize / RENDER_SCALE,
+          font: jpFont,
+          color: rgb(r, g, b),
+        });
+      }
+    }
+
+    const outBytes = await pdfLibDoc.save();
+    const blob = new Blob([outBytes], { type: 'application/pdf' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'edited.pdf';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    alert('保存中にエラーが発生しました: ' + err.message);
+    console.error(err);
+  } finally {
+    saveBtn.disabled = false;
+    saveBtn.textContent = 'PDFを保存';
+  }
+});
+</script>
+</body>
+</html>
